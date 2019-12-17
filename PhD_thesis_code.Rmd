@@ -1,0 +1,1428 @@
+---
+title: "An improved pipeline for LC-MS spectra processing and annotation"
+always_allow_html: true
+output:
+ html_document:
+    toc: true
+    # toc_float: false
+    number_sections: false
+    toc_depth: 4
+author: Elzbieta Lauzikaite
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+---
+
+<style>
+pre code, pre, code {
+  white-space: pre !important;
+  overflow-x: scroll !important;
+  word-break: keep-all !important;
+  word-wrap: initial !important;
+}
+</style>
+
+```{r setup, echo = FALSE, include = FALSE}
+options(width = 999)
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+# Color Format
+colFmt <- function(x, color) {
+  outputFormat <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+  if (outputFormat == "latex") {
+    paste("\\textcolor{", color, "}{", x, "}", sep = "")
+  } else if (outputFormat == "html") {
+    paste("<font color='", color, "'>", x, "</font>", sep = "")
+  } else {
+    x
+  }
+}
+```
+
+The details of the PhD thesis analyses are provided in this document. The **R** and **Python** scripts utilised in the analyses are sorted according to the chapters in which they appeared. Links to all required external libraries, as well as additional developed scripts are provided in the document. 
+
+`massFlowR` code developed during the PhD is available on its [GitHub repository](https://github.com/lauzikaite/massFlowR). Only the names of the functions and methods exported from the `massFlowR` namespace are provided in this document. 
+
+# Glossary
+
+**PCS** - *pseudo chemical spectra* - list of structurally related co-eluting features
+
+**ROI** - *regions of interest* - reference RT and m/z windows in which to search for a feature
+
+**IPC** - *Imperial Phenome Centre* 
+
+# Computing environment
+
+Analyses were performed on **R** and **Python** environments. Versions for the most version-sensitive libraries are provided.
+
+```{r, eval=TRUE,message=FALSE,results='asis',echo=FALSE}
+options(knitr.kable.NA = "")
+library(magrittr)
+library(kableExtra)
+dt <- setNames(
+  data.frame(
+    c("3.0.0", NA),
+    c("3.4.4", NA),
+    c(NA, "1.2.1"),
+    row.names = c("XCMS", "nPYc")
+  ),
+  nm = c("3.4.0", "3.5.1", "3.6")
+)
+
+kable(dt,
+  align = rep("c", 3)
+) %>%
+  kable_styling("striped", full_width = TRUE, position = "left") %>%
+  add_header_above(c(" " = 1, "R" = 2, "Python" = 1))
+```
+
+To install all **R** dependencies required in this document, run the following function:
+
+```{r}
+# To install dependencies
+install_bioconductor <- function() {
+  dependencies <- c("xcms", "MSnbase", "faahKO", "igraph", "doParallel", "foreach", "ggplot2", "viridis", "gridExtra", "tidyr", "cowplot", "viridis", "dplyr", "IPO", "peakPantheR")
+  installed <- installed.packages()
+  to_install <- subset(dependencies, !(dependencies %in% installed[, "Package"]))
+  if (length(to_install) != 0) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+      install.packages("BiocManager")
+    }
+    message("Installing packages: ", to_install, " ...")
+    BiocManager::install(to_install)
+  } else {
+    message("All dependencies are already installed.")
+  }
+}
+install_bioconductor()
+
+## finally, install massFlowR
+devtools::install_github("lauzikaite/massflowR", dependencies = FALSE)
+```
+
+# Chapter 2
+
+## Standard peakPantheR workflow
+
+Endogenous metabolites were detected and integrated using R package `peakPantheR`, which is available on [Bioconductor](https://bioconductor.org/packages/release/bioc/html/peakPantheR.html). For details on the workflow, please refer to the [GitHub](https://github.com/phenomecentre/peakPantheR/) repository and provided tutorials.
+
+The preliminary RT and m/z ROI were kindly provided by the IPC team. These regions were further optimised using `peakPantheR` package, with the final values provided in **Thesis Appendix A and Appendix B**. A standard `peakPantheR` worflow was applied as follows. 
+
+```{r}
+library(peakPantheR)
+
+# Inputs ----------------------------------------------------------------
+meta <- read.csv(
+  file = "path to study metadata", # study metadata with sample acquisition order and sample type
+  header = TRUE, stringsAsFactors = FALSE
+)
+
+## select pooled QC samples only
+selected_dt <- subset(meta[order(meta$run_order), ], class == "Study Pool")
+
+# New annotation ----------------------------------------------------------
+new_anno <- peakPantheR_loadAnnotationParamsCSV(CSVParamPath = "path to table with ROI values")
+new_anno <- resetAnnotation(new_anno,
+  spectraPaths = meta$filepath,
+  spectraMetadata = meta,
+  useUROI = TRUE,
+  useFIR = TRUE
+)
+new_anno_res <- peakPantheR_parallelAnnotation(new_anno,
+  ncores = 6,
+  verbose = TRUE
+)
+final_anno <- new_anno_res$annotation
+
+cols <- unname(setNames(viridis::viridis(n = nrow(meta)),
+  nm = seq(nrow(meta))
+)[spectraMetadata(final_anno)$total_order])
+outputAnnotationDiagnostic(final_anno,
+  saveFolder = "path to output directory",
+  savePlots = TRUE,
+  sampleColour = cols,
+  verbose = TRUE
+)
+outputAnnotationResult(final_anno,
+  saveFolder = "path to output directory",
+  annotationName = "study name",
+  verbose = TRUE
+)
+
+# Re-integrate missed samples ----------------------------------------------
+miss_dt <- subset(meta, filepath %in% new_anno_res$failures$file)
+miss_anno <- resetAnnotation(final_anno,
+  spectraPaths = new_anno_res$failures$file,
+  spectraMetadata = miss_dt,
+  useUROI = TRUE,
+  useFIR = TRUE
+)
+miss_anno_res <- peakPantheR_parallelAnnotation(miss_anno,
+  ncores = 0, ## serial, since macOS tend to fail mzML reading
+  verbose = TRUE
+)
+```
+
+## IPO optimisation
+
+It was attempted to optimise centWave peak-picking parameters with an open-source package `IPO`, which is available on [Bioconductor](https://www.bioconductor.org/packages/release/bioc/html/IPO.html). 
+
+Parameters which were not optimised by `IPO` were provided as a single starting value. Parameters that were set for optimisation were listed with lower and upper starting values:
+
+* min_peakwidth - minimum peak width in chromatographic space, sec
+* max_peakwidth - maximum peak width in chromatographic space, sec
+* noise - centroids with intensity < noise are omitted from ROI detection
+* prefilter - during ROI detection, mass traces are only retained if they contain at least [prefilter] peaks
+* value_of_prefilter - during ROI detection, mass traces are only retained if they contain at least [prefilter] peaks with [value_of_prefilter] intensity
+* snthresh -  signal/noise ratio: ([maximum peak intensity] - [estimated baseline value]) / standard deviation of local chromatographic noise 
+
+```{r}
+library(IPO)
+
+## set centWave parameters for optimisation
+ppparam <- getDefaultXcmsSetStartingParams('centWave')
+ppparam$min_peakwidth <- c(1.5, 3) 
+ppparam$max_peakwidth <- c(5, 20) 
+ppparam$noise <- c(200, 1000) 
+ppparam$prefilter <- c(4, 10)
+ppparam$value_of_prefilter <- c(500,10000)
+ppparam$snthresh <- c(3, 5) 
+
+## set values not to be optimised
+ppparam$ppm <- 25
+ppparam$mzdiff <- 0.01
+ppparam$integrate <- 2
+ppparam$mzCenterFun <- 'wMean'
+
+opp <- optimizeXcmsSet(files = files,
+                       params = ppparam,
+                       BPPARAM = MulticoreParam(workers = bw), # number of parallel workers
+                       nSlaves = 1, # must be 1 if BPPARAM is used
+                       subdir = "path to output directory"
+                       )
+print(opp$best_settings$result)
+print(opp$best_settings$parameters)
+```
+
+## XCMS version 2 syntax
+
+AIRWAVE study datasets were processed with the standard `XCMS` pipeline, using the **version 2 syntax**. The exact XCMS parameters vary from assay to assay, details for which are provided in **Thesis Chapter 2, Section 2.3.3 "XCMS pre-processing"**.
+
+```{r}
+library(xcms)
+
+# Peak-picking ------------------------------------------------------------
+xset <- xcmsSet(
+  files = "paths to mzML files",
+  method = "centWave",
+  peakwidth = c(1.5, 14),
+  ppm = 25,
+  noise = 500,
+  snthresh = 5,
+  mzdiff = 0.01,
+  prefilter = c(10, 3000),
+  mzCenterFun = "wMean",
+  integrate = 2,
+  fitgauss = FALSE,
+  verbose.columns = FALSE,
+  BPPARAM = MulticoreParam(workers = ...)
+)
+
+# Grouping ----------------------------------------------------------------
+gset <- group(xset,
+  method = "density",
+  minfrac = 0,
+  minsamp = 0,
+  bw = 2,
+  mzwid = 0.01
+)
+
+# RT correction -------------------------------------------------------------
+rset <- retcor.peakgroups(gset,
+  plottype = "none",
+  smooth = "loess",
+  missing = 10,
+  extra = 10,
+  span = 10
+)
+
+# Grouping -----------------------------------------------------------------
+grset <- group(rset,
+  method = "density",
+  minfrac = 0,
+  minsamp = 0,
+  bw = 2,
+  mzwid = 0.01
+)
+
+# Filling peaks ------------------------------------------------------------
+fset <- fillPeaks(grset,
+  method = "chrom",
+  BPPARAM = MulticoreParam(workers = bw)
+)
+```
+
+## QC pipeline
+
+Standard quality control pipeline was applied to every processed dataset. Python library `nPYc` was utilised. It is available through `pip`. For details please refer to its extensive [documentation](https://npyc-toolbox.readthedocs.io/en/latest/), or the [HitHub repository](https://github.com/phenomecentre/nPYc-Toolbox).  
+
+The main QC pipeline stages are outlined below.
+
+```{python, eval=FALSE}
+## Python script for post-processing QC assesment
+import os
+import matplotlib.pyplot as plt
+import scipy
+import pandas
+import numpy
+import pickle
+import seaborn as sns
+from plotly.offline import init_notebook_mode, iplot
+import sys
+import nPYc
+import pyChemometrics
+import copy
+from nPYc.enumerations import VariableType, DatasetLevel, AssayRole, SampleType
+from nPYc.utilities.normalisation import NullNormaliser, TotalAreaNormaliser, ProbabilisticQuotientNormaliser
+
+## load dataset
+dataset=nPYc.MSDataset('path to peak-picked dataset', fileType='XCMS', sop='GenericMS', ...)
+dataset.addSampleInfo(descriptionFormat='Basic CSV', filePath='path to study metadata')
+
+# =============================================================================
+# Feature filtering
+# =============================================================================
+## is batch correction is desired?
+datasetCorrected=dataset # if no batch correction is desired
+datasetCorrected=nPYc.batchAndROCorrection.correctMSdataset(dataset, window=11) # if batch correction is desired
+
+## extract RSD and correlation to dilution values for each feature
+rsd=nPYc.utilities.rsdsBySampleType(datasetCorrected)
+featuresOutput={
+    'peakid': dataset.featureMetadata['peakid'],
+    'rsd': nPYc.utilities.rsd(dataset.intensityData),
+    'rsd_StudyPool': rsd['Study Pool'],
+    'rsd_ExternalReference': rsd['External Reference'],
+    'cor_to_dilution': dataset.correlationToDilution
+}
+dt=pandas.DataFrame(data=featuresOutput)
+
+## apply feature and sample masks
+## feature correction according to standard nPYc criteria: correlation to dilution and RSD
+datasetCorrected.updateMasks(
+     sampleTypes=[SampleType.StudySample, SampleType.StudyPool],
+     assayRoles=[AssayRole.Assay, AssayRole.PrecisionReference],
+    filterFeatures=True) 
+datasetCorrected.applyMasks()
+
+# =============================================================================
+# PCA: scores, loadings and correlation
+# =============================================================================
+## build cross-validated PCA model
+PCAmodel=nPYc.multivariate.exploratoryAnalysisPCA(datasetCorrected, scaling=1)
+
+## extract hotellings values
+t2=PCAmodel.hotelling_T2(comps=[0,1])
+angle=numpy.arange(-numpy.pi, numpy.pi, 0.01)
+x=t2[0] * numpy.cos(angle)
+y=t2[1] * numpy.sin(angle)
+hotelling=pandas.DataFrame(x) # final table with values
+
+## get PCA scores
+scores=PCAmodel.scores
+df=pandas.DataFrame(scores)
+df.columns=['PC' + str(i + 1) for i in range(scores.shape[1])]
+df['Sample File Name']=datasetCorrected.sampleMetadata['Sample File Name']
+df['Class']=datasetCorrected.sampleMetadata['Class'] # final table with values
+
+## variance explained by each PC
+var=pandas.DataFrame(PCAmodel.modelParameters['VarExpRatio'])
+var.columns=['Variance'] # final table with values
+
+## PCA scores correlation with continuous data
+cont_cor=list()
+variables=['Backing', 'Collision', 'Detector', 'TOF', 'Run Order', 'Age']
+for var_name in variables:
+    cor=nPYc.multivariate.pcaSignificance(values=PCAmodel.scores,
+                                            classes=datasetCorrected.sampleMetadata[var_name],
+                                            valueType='continuous')
+    cont_cor.append(cor)
+cont_cor=pandas.DataFrame(cont_cor)
+cont_cor.columns=['PC' + str(i + 1) for i in range(cont_cor.shape[1])]
+cont_cor.index=variables
+
+## PCA scores correlation with categorical data
+cat_cor=list()
+variables=['Well', 'Plate', 'Sample position', 'Sample batch', 'Gender', 'BMI_cat']
+for var_name in variables:
+    cor=nPYc.multivariate.pcaSignificance(values=PCAmodel.scores,
+                                            classes=datasetCorrected.sampleMetadata[var_name],
+                                            valueType='categorical')
+    cat_cor.append(cor)
+cat_cor=pandas.DataFrame(cat_cor)
+cat_cor.columns=['PC' + str(i + 1) for i in range(cat_cor.shape[1])]
+cat_cor.index=variables 
+
+## bind both tables together and save into one table
+df=pandas.concat([cont_cor, cat_cor])
+df['variable']=['continuous' if x in ['Backing', 'Collision', 'Detector', 'TOF', 'Run Order', 'Age'] else 'categorical' for x in df.index] 
+
+```
+
+# Chapter 3
+
+## Pipeline development
+ 
+### Pseudo chemical spectra generation
+
+#### Gaussian shape analysis
+
+To evaluate how well EIC correlation distinguishes similar peaks among co-eluting peaks, a simulation was first performed with peaks of identical shape. A characteristic chromatographic peak, missing a few scans and fitting a Gaussian curve well, was identified in the raw data of a representative urine sample. 
+
+All required functions are provided in the  *simulation-selfEIC-correlation.R* script. Load the required functions:
+
+```{r, }
+source(file = "./Chapter_3/simulation-selfEIC-correlation.R")
+```
+
+Simulation was performed using DEVSET study's pooled quality control sample **PipelineTesting_RPOS_ToF10_U1W24_SR**. 
+
+```{r}
+## Peak-pick a raw file
+rw <- MSnbase::readMSData("path to the raw mzML file", 
+                          msLevel. = 1, 
+                          mode = "onDisk")
+cwt <- xcms::CentWaveParam(
+  ppm = 25,
+  snthresh = 5,
+  noise = 200,
+  prefilter = c(10, 5000),
+  peakwidth = c(1.5, 5),
+  mzdiff = 0,
+  verboseColumns = TRUE, # essential to extract Gaussian model values
+  fitgauss = TRUE # fits Gaussian model to the chromatographic shape
+)
+## to avoid a reported bug of centWave not returning Gaussian fit results:
+## register serial backend and load XCMS fully instead of taking function from its namespace
+## https://github.com/sneumann/xcms/issues/352
+library(xcms)
+BiocParallel::register(BiocParallel::SerialParam())
+res <- findChromPeaks(object = rw,
+                      param = cwt)
+pks <- data.frame(chromPeaks(res))
+pks <- pks[order(pks$into, decreasing = TRUE), ] # order by decreasing intensity to have nice peaks first
+
+## extract EIC for every picked peak
+eic <- xcms::chromatogram(rw,
+  rt = data.frame(rt_lower = pks$rtmin, rt_upper = pks$rtmax),
+  mz = data.frame(mz_lower = pks$mzmin, mz_upper = pks$mzmax)
+)
+clean_eic <- lapply(1:nrow(eic), function(ch) {
+  MSnbase::clean(eic[ch, ], na.rm = T)
+})
+
+## Identify a peak with an elution profile that fits gaussian the best
+## Function will make a plot for every peak
+fit <- lapply(1:nrow(pks),
+              FUN = checkPk,
+              eic = eic)
+p <- 25 # this peak was selected at random from the appropriatelly looking peaks
+
+## Perform self-EIC-correlation using the reference peak
+corPk(pk = p,
+      out_dir = "path to output directory", 
+      eic = eic)
+```
+
+
+#### EIC correlation of endogenous metabolites
+
+
+EIC correlation of ions corresponding to 15 endogenous metabolites in DEVSET samples was performed. All required functions are provided in the  *endogenous-metabolites-EICcorrelation.R* script. Load the required functions:
+
+
+```{r, }
+source(file = "./Chapter_3/endogenous-metabolites-EICcorrelation.R")
+```
+
+
+First, 15 `r colFmt("endogenous metabolites and their main adducts and in-source fragments", "Crimson")` were identified in the LC-MS spectra of all DEVSET samples using m/z and RT regions kindly provided by the IPC team. The integration regions were optimised using `peakPantheR` package. General script for the workflow is provided in this document's section [standard peakPantheR workflow](#standard-peakpanther-workflow). 
+
+
+```{r}
+# Peak-pick DEVSET samples ------------------------------------------------
+samples_rnames <- "paths to DEVSET raw mzML files"
+raw <- MSnbase::readMSData(samples_rnames,
+  msLevel. = 1,
+  mode = "onDisk"
+)
+raw_ls <- split(raw, fromFile(raw))
+cwt <- xcms::CentWaveParam(
+  ppm = 25,
+  snthresh = 5,
+  noise = 200,
+  prefilter = c(10, 5000),
+  peakwidth = c(1, 5),
+  mzdiff = 0,
+  verboseColumns = TRUE
+)
+doParallel::registerDoParallel(cores = 6)
+result <- foreach::foreach(
+  f = samples_rnames,
+  .inorder = TRUE,
+  .errorhandling = "pass"
+) %dopar% {
+  raw <- massFlowR:::readDATA(f = f)
+  res <- xcms::findChromPeaks(
+    object = raw,
+    param = cwt
+  )
+  pks <- data.frame(xcms::chromPeaks(res))
+  return(pks)
+}
+
+# Find features corresponding to metabolites ------------------------------
+## mz and rt regions for endogenous metabolites were optimised using peakPantheR library
+## script is provided in this document under Chapter 2, "Standard peakPantheR workflow"
+## mz/rt regions for DEVSET samples are provided in Thesis Appendix B, Table B.1
+standards <- read.csv(
+  file = "metabolites_roi.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+ids <- unique(standards$cpdID.metabolite)
+selected_standards <- ids
+roi <- prepROI(
+  data_dir = ppr_dir,
+  metabolites_ids = gsub("-", ".", standards$cpdID),
+  samples_fnames = samples_fnames
+)
+
+## find corresponding features
+matches <- lapply(samples_ind, function(ns) {
+  dat <- result[[which(samples_ind == ns)]]
+  roi_ns <- roi[[which(samples_ind == ns)]]
+  lapply(seq(nrow(roi_ns)), function(n) {
+    dat[which(
+      dat$mz >= roi_ns$mzMin[n] &
+        dat$mz <= roi_ns$mzMax[n] &
+        dat$rt >= roi_ns$rtMin[n] &
+        dat$rt <= roi_ns$rtMax[n]
+    ), c("mz", "mzmin", "mzmax", "rt", "rtmin", "rtmax", "scpos", "into")]
+  })
+})
+
+## omit samples that failed to be integrated with ppR (if any)
+sel_samples_ind <- samples_ind[-c(which(sapply(roi, is.null)))]
+sel_samples_rnames <- samples$raw_filepath[sel_samples_ind]
+sel_samples_fnames <- samples$filename[sel_samples_ind]
+```
+
+
+Next, the `r colFmt("EIC of the centWave features", "Crimson")` corresponding to metabolites adducts and in-source fragments were correlated.
+
+
+```{r, }
+# EIC correlation of endogenous metabolites ions ---------------------------
+cor_results <- list()
+
+for (id in ids) {
+  message("checking compound: ", id)
+  id_inds <- which(standards$cpdID.metabolite == id)
+
+  ## correlated main adduct and its validated adduct(s)
+  matches_id <- lapply(sel_samples_ind, function(ns) {
+    matches_ind <- matches[[which(samples_ind == ns)]][id_inds]
+    matches_n <- unlist(lapply(matches_ind, nrow))
+
+    ## if there are multiple matches, the the one which is closer in scpos to the adduct match
+    if (length(which(matches_n > 1)) > 0) {
+      if (length(which(matches_n == 1)) == 1) {
+        scpos_ref <- matches_ind[[which(matches_n == 1)]]$scpos
+      } else {
+        into_highest <- which.max(matches_ind[[1]]$into)
+        scpos_ref <- matches_ind[[1]]$scpos[into_highest]
+      }
+      lapply(matches_ind, function(dat) {
+        match_closest <- which.min(abs(dat$scpos - scpos_ref))
+        dat[match_closest, ]
+      })
+    } else {
+      matches_ind
+    }
+  })
+
+  ## (2) extract eic
+  matches_eic <- lapply(sel_samples_ind, function(ns) {
+    matches_ind <- matches_id[[which(sel_samples_ind == ns)]]
+    ## extract EIC if atleast two adducts are present
+    if (length(which(sapply(matches_ind, nrow) > 0)) >= 2) {
+      massFlowR:::extractEIC(raw_ls[[which(samples_ind == ns)]],
+        pks = do.call(rbind, matches_ind)
+      )
+    }
+  })
+  matches_eic_ind <- which(!sapply(matches_eic, is.null))
+
+  ## (3) correlate eic of the main adduct (1st in the list) and all associated adducts
+  matches_cor <- lapply(matches_eic_ind, function(ns) {
+    eic <- matches_eic[[ns]]
+    rx <- MSnbase::rtime(eic[[1]])
+    unlist(lapply(2:length(eic), function(y) {
+      ry <- MSnbase::rtime(eic[[y]])
+      common_scan <- base::intersect(rx, ry)
+      if (length(common_scan) > 3) {
+        ix <-
+          as.numeric(MSnbase::intensity(eic[[1]])[which(rx %in% common_scan)]) ## main adduct
+        iy <-
+          as.numeric(MSnbase::intensity(eic[[y]])[which(ry %in% common_scan)]) ## iterator
+        cor(ix, iy, method = "pearson", use = "pairwise.complete.obs")
+      } else {
+        0
+      }
+    }))
+  })
+
+  ## save output
+  cor_results[[length(cor_results) + 1]] <- matches_cor
+}
+
+## Make plots
+cor_all <- lapply(selected_standards, function(id) {
+  data.frame(
+    cor = unlist(cor_results[[which(selected_standards == id)]]),
+    id = id,
+    metabolite = standards$cpdName[standards$cpdID.metabolite == id][1],
+    stringsAsFactors = FALSE
+  )
+})
+cor_all <- do.call(rbind, cor_all)
+cor_all <- subset(cor_all, cor > 0)
+
+library(ggplot2)
+ggplot(data = cor_all) +
+  geom_density(aes(x = cor, group = metabolite), fill = "#440154FF", color = "white") +
+  scale_x_continuous("EIC correlation") +
+  scale_y_continuous("Density") +
+  geom_vline(aes(xintercept = 0.95), linetype = "dashed") +
+  facet_wrap(~metabolite, ncol = 3, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    axis.line = ggplot2::element_line(size = 0.1)
+  )
+```
+
+
+### Feature alignment across samples
+
+
+Spectral similarity between PCS that comprise of features corresponding to endogenous metabolites was analysed using three intensity scaling strategies:
+
+1. No scaling
+2. Square-root intensity scaling
+3. Weight-based intensity scaling
+
+Scaled spectra was then normalised to the total magnitude of the spectral vector. A simple spectral dot product function was then applied to determine spectral similarity between the PCS in the first DEVSET sample in which adducts of metabolite-of-interest were detected and all following samples. All required functions are provided in the *endogenous-metabolites-spectral-scaling.R* script. Load required functions:
+
+```{r, }
+source(file = "./Chapter_3/endogenous-metabolites-spectral-scaling.R")
+```
+
+Firstly, `r colFmt("features corresponding to endogenous metabolites", "Crimson")` were found as in the earlier [section](#eic-correlation-of-endogenous-metabolites). 
+
+Then, the `r colFmt("spectral similarity was compared", "Crimson")` using different scaling methods. 
+
+```{r}
+library(dplyr)
+library(ggplot2)
+## all other required packaged are listed in the endogenous-metabolites-spectral-scaling.R script
+## they need to be installed, but not loaded
+
+# For each metabolite -----------------------------------------------------
+for (id in ids) {
+  message("checking compound: ", id)
+  id_inds <- which(standards$cpdID.metabolite == id)
+
+  ## extract main adduct and its validated adduct(s) from all samples
+  matches_id <- lapply(sel_samples_ind, function(ns) {
+    matches_ind <- matches[[which(samples_ind == ns)]][id_inds]
+    matches_n <- unlist(lapply(matches_ind, nrow))
+
+    ## if there are multiple matches, take the one which is closer in 'scpos' to the adduct match
+    if (length(which(matches_n > 1)) > 0) {
+      if (length(which(matches_n == 1)) == 1) {
+        scpos_ref <- matches_ind[[which(matches_n == 1)]]$scpos
+      } else {
+        into_highest <- which.max(matches_ind[[1]]$into)
+        scpos_ref <- matches_ind[[1]]$scpos[into_highest]
+      }
+      lapply(matches_ind, function(dat) {
+        match_closest <- which.min(abs(dat$scpos - scpos_ref))
+        dat[match_closest, ]
+      })
+    } else {
+      matches_ind
+    }
+  })
+  ## samples in which features corresponding to both adducts are available
+  ## samples in which features corresponding to both adducts are in the same peakgr
+  peakgroups_id <- sapply(sel_samples_ind, function(ns) {
+    matches_ns_1 <- matches_id[[which(sel_samples_ind == ns)]][[1]]
+    matches_ns_2 <- matches_id[[which(sel_samples_ind == ns)]][[2]]
+    if (all(nrow(matches_ns_1) > 0 & nrow(matches_ns_2) > 0)) { # if none of the adducts have duplicating features
+      if (matches_ns_1$tmp_peakgr == matches_ns_2$tmp_peakgr) { # if both adducts are assigned to the same peakgroup
+        matches_ns_1$tmp_peakgr
+      } else {
+        0
+      }
+    } else {
+      0
+    }
+  })
+
+  ## extract whole peakgroups from every sample
+  peakgroups_dat <- lapply(sel_samples_ind[which(peakgroups_id != 0)], function(ns) {
+    dat <- object@data[[ns]]
+    pkg <- peakgroups_id[[which(sel_samples_ind == ns)]]
+    dat <- dat[dat$tmp_peakgr == pkg, ]
+    if (nrow(dat) > 0) {
+      ## scale vector un three different ways
+      # dat$into <- dat$into # unscaled, redundant
+      dat$into_sqrt <- sqrt(dat$into) # sqrt-scaled
+      dat$into_weight <- apply(setNames(dat[, c("mz", "into")], # weight-scaled
+        nm = c("mz", "into")
+      ),
+      1,
+      ## normalise scaled vector to the total magnitude of the spectral vector
+      FUN = scaleWEIGHT
+      )
+      ## now normalise scaled vectors to the total magnitude of the spectral vecto
+      dat$into_norm <- normMAGN(into = dat$into) # no-scaling, normalised
+      dat$into_sqrt_norm <- normMAGN(into = dat$into_sqrt) # sqrt-scaling, nornalised
+      dat$into_weight_norm <- normMAGN(into = dat$into_weight) # weight-scaling, normalised
+
+      ## sample number/index here refers to run order
+      dat$run_order <- ns
+
+      ## mark whether extracted feature corresponds to either of the validated adducts
+      ## 1 - the main ion
+      ## 2 - any other ion in the peakPantheR list
+      ## these will be used to color the spectral 'pins'
+      dat$adduct <- 0
+      dat$adduct[dat$tmp_peakid %in% matches_id[[which(sel_samples_ind == ns)]][[1]]$tmp_peakid] <- 1
+      dat$adduct[dat$tmp_peakid %in% matches_id[[which(sel_samples_ind == ns)]][[2]]$tmp_peakid] <- 2
+      return(dat)
+    }
+  })
+  peakgroups_dat <- do.call(rbind, peakgroups_dat)
+
+  ## build spectra: reference spectra comes from the 1st sample that this peakgroup was built in
+  ref <- subset(peakgroups_dat, run_order == min(run_order))
+  ## sample spectra: all other samples that contain this peakgroup
+  sample_specs <- subset(peakgroups_dat, run_order != min(run_order))
+
+  # obtain cosines ----------------------------------------------------------
+  cos <- data.frame()
+  for (ro in unique(sample_specs$run_order)) {
+    ## extract peaks from the reference spectra and sample spectra
+    ds <- subset(sample_specs, run_order == ro)
+    all_peaks <- c(ref$mz, ds$mz)
+    ## put all peaks mz values together
+    spec <- data.frame(
+      mz = seq(
+        from = min(all_peaks),
+        to = max(all_peaks),
+        by = 0.01
+      )
+    )
+    spec$bin <- 1:nrow(spec)
+    cos_ls <-
+      lapply(c("none", "sqrt", "weight"), function(scale_i) {
+        getCOS(
+          spec = spec, target_peaks = ref, matched_peaks = ds,
+          scale = scale_i, norm = TRUE
+        )
+      })
+    cos <- rbind(
+      cos,
+      data.frame(
+        run_order = ro,
+        no_scale_norm = cos_ls[[1]],
+        scale_sqrt_norm = cos_ls[[2]],
+        scale_weight_norm = cos_ls[[3]]
+      )
+    )
+  }
+
+  # make spectra plots ------------------------------------------------------
+  n_peaks <- peakgroups_dat %>%
+    group_by(run_order) %>%
+    summarise(n = n()) %>%
+    ungroup()
+
+  ## how many peaks are in each sample?
+  cos$n_peaks <- n_peaks$n[match(cos$run_order, n_peaks$run_order)]
+  cos_long <- tidyr::gather(cos, key = "scaling", value = cos, -run_order, -n_peaks)
+
+  gg_labels <- setNames(c("No-scaling, normalised", "Sqrt-scaled, normalised", "Weight-scaled, normalised"),
+    nm = c("no_scale_norm", "scale_sqrt_norm", "scale_weight_norm")
+  )
+
+  ## Plot distribution accr to number of features per pseudo chemical spectra
+  ggplot(cos_long) +
+    geom_boxplot(aes(x = as.factor(n_peaks), y = cos, fill = scaling), position = "dodge2") +
+    scale_fill_viridis_d(
+      begin = 0.1,
+      name = "Spectra processing",
+      labels = gg_labels
+    ) +
+    facet_wrap(~scaling,
+      labeller = as_labeller(gg_labels)
+    ) +
+    scale_y_continuous(name = "Spectral similarity") +
+    scale_x_discrete(name = "Number of features in pseudo chemical spectra") +
+    ggtitle(paste0(standards$cpdName[id_inds][1], ", ", id)) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = "bottom",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(size = 0.1)
+    )
+
+  ## Plot spectral similarity plots, multiple scenarios are possible for each metabolite:
+  ## (A) unit and weight scaling gives the same cos
+  ## (B) unit and weight scaling gives opposite cos
+  ## (C) unit and weight scaling gives opposite cos
+  cos_A <- subset(cos, (no_scale_norm > 0.9 & scale_sqrt_norm > 0.9 & scale_weight_norm > 0.9) |
+    (no_scale_norm < 0.3 & scale_sqrt_norm < 0.3 & scale_weight_norm < 0.3))
+  cos_B <- subset(cos, (no_scale_norm > 0.9 & scale_sqrt_norm > 0.9 & scale_weight_norm < 0.3))
+  cos_C <- subset(cos, (no_scale_norm < 0.9 & scale_sqrt_norm < 0.9 & scale_weight_norm > 0.3))
+  ## make single plot per metabolite depending on which scenario it falls under
+  if (nrow(cos_A) > 0) {
+    plotSCENARIO(scen = cos_A, peakgroups_dat = peakgroups_dat, scen_name = "A", ref = ref, id = id)
+  }
+  if (nrow(cos_B) > 0) {
+    plotSCENARIO(scen = cos_B, peakgroups_dat = peakgroups_dat, scen_name = "B", ref = ref, id = id)
+  }
+  if (nrow(cos_C) > 0) {
+    plotSCENARIO(scen = cos_C, peakgroups_dat = peakgroups_dat, scen_name = "C", ref = ref, id = id)
+  }
+}
+```
+
+### Feature alignment validation
+
+#### Pearson correlation of endogenous metabolites
+
+Pearson intensity correlation of features corresponding to 15 endogenous metabolites in DEVSET samples.
+
+Firstly, `r colFmt("features corresponding to endogenous metabolites", "Crimson")` are found as in the earlier [section](#eic-correlation-of-endogenous-metabolites).
+
+Then, the `r colFmt("main ion of each metabolite is correlated", "Crimson")` with all its validated adducts and in-source fragments.
+
+```{r, eval=FALSE}
+# Pearson Iintensity correlation ------------------------------------------
+int_cor_res <- data.frame(stringsAsFactors = FALSE)
+
+for (id in selected_standards) {
+  message("checking compound: ", id)
+  id_inds <- which(standards$cpdID.metabolite == id)
+
+  ## main adduct and its validated adduct(s)
+  matches_id <- lapply(sel_samples_ind, function(ns) {
+    matches_ind <- matches[[which(samples_ind == ns)]][id_inds]
+    matches_n <- unlist(lapply(matches_ind, nrow))
+
+    ## if there are multiple matches, the the one which is closer in scpos to the adduct match
+    if (length(which(matches_n > 1)) > 0) {
+      if (length(which(matches_n == 1)) == 1) {
+        scpos_ref <- matches_ind[[which(matches_n == 1)]]$scpos
+      } else {
+        into_highest <- which.max(matches_ind[[1]]$into)
+        scpos_ref <- matches_ind[[1]]$scpos[into_highest]
+      }
+      lapply(matches_ind, function(dat) {
+        match_closest <- which.min(abs(dat$scpos - scpos_ref))
+        dat[match_closest, ]
+      })
+    } else {
+      matches_ind
+    }
+  })
+  main <- unlist(lapply(matches_id, function(s) {
+    if (nrow(s[[1]]) > 0) {
+      s[[1]]$into
+    } else {
+      NA
+    }
+  }))
+
+  ## (A) correlation with true adduct(s)
+  cor_adducts <- lapply(2:length(id_inds), function(ind) {
+    other <- unlist(lapply(matches_id, function(s) {
+      if (nrow(s[[ind]]) > 0) {
+        s[[ind]]$into
+      } else {
+        NA
+      }
+    }))
+    if (length(other[!is.na(other)]) > 0) {
+      cor(main, other, method = "pearson", use = "pairwise.complete.obs")
+    } else {
+      NA
+    }
+  })
+  cor_adducts <- data.frame(
+    id = id,
+    main = standards$cpdName[id_inds[1]],
+    adduct = standards$cpdName[id_inds[-1]],
+    adduct_idn = standards$cpdID.n[id_inds[-1]],
+    cor = unlist(cor_adducts),
+    stringsAsFactors = FALSE
+  )
+
+  int_cor_res <- rbind(int_cor_res, cor_adducts)
+}
+```
+
+## Comparison to other tools
+
+### Synthetic data generation
+
+All synthetic datasets were generated using a single peaks table obtained for a real quality control sample from the DEVSET study. Study data can be downloaded from the MetaboLights server (study identifier [MTBLS694](https://www.ebi.ac.uk/metabolights/MTBLS694)).
+
+The reference sample used in synthetic data generation is **PipelineTesting_RPOS_ToF10_U1W24_SR**. Corresponding mzML file was processed with the `masflowR` pipeline to generate pseudo chemical spectra (here referred to as peak groups, which comprise of structurally related co-eluting features) as follows:
+
+```{r}
+library(massFlowR)
+library(xcms)
+fname <- "path to the raw mzML file"
+## centWave parameters for peak-picking
+cwt <- xcms::CentWaveParam(
+  ppm = 25,
+  snthresh = 5,
+  noise = 200,
+  prefilter = c(10, 5000),
+  peakwidth = c(1, 5),
+  mzdiff = 0,
+  verboseColumns = TRUE
+)
+## process the reference sample, function will write a .csv file in the out_dir
+massFlowR::groupPEAKS(file = fname, cwt = cwt, out_dir = "output directory/")
+```
+
+Synthetic data was generated using functions defined in *synthetic-data-generation_functions.R script*. Load the required functions:
+
+```{r}
+source(file = "./Chapter_3/synthetic-data-generation.R")
+```
+
+First, the `r colFmt("nonlinear RT drifts", "Crimson")` were modeled using cubic spline function. Features corresponding to 15 validated metabolites were identified in the DEVSET quality control samples. The code for this step is provided in the earlier [section](#eic-correlation-of-endogenous-metabolites). The RT of the features corresponding to the metabolites was modeled as below. Only the final spline model output is needed for synthetic data generation (argument `drift` for function `simulateDATA`).
+
+```{r}
+# RT deviation for every feature ------------------------------------------
+adducts <- lapply(ids, function(id) {
+  message("checking compound: ", id)
+  ## take only the main adduct for the compound
+  id_ind <- which(standards$cpdID.metabolite == id)[1]
+
+  ## extract corresponding feature from every sample
+  sapply(sel_samples_ind, function(ns) {
+    matches_ns <- matches[[which(samples_ind == ns)]][[id_ind]]
+    if (nrow(matches_ns) > 1) {
+      stop(ns)
+    } else {
+      if (nrow(matches_ns) == 0) {
+        return(NA)
+      }
+    }
+    return(matches_ns$rt)
+  })
+})
+## extract endogenous metabolites names
+cpdNames <- unlist(lapply(ids, function(id) {
+  id_ind <- which(standards$cpdID.metabolite == id)[1]
+  standards$cpdName[id_ind]
+}))
+## make a summary data.frame with RT in every sample, for every metabolite
+gdf <- data.frame(
+  compound = rep(cpdNames, each = length(sel_samples_fnames)),
+  compound_no = rep(seq(length(cpdNames)), each = length(sel_samples_fnames)),
+  sample = rep(seq(length(sel_samples_fnames)), length(cpdNames)),
+  rt = unlist(adducts),
+  stringsAsFactors = FALSE
+)
+gdf_spline <- setNames(gdf, nm = c("compound", "compound_no", "x", "y"))
+## fit cubic smoothing spline to every metabolite's RT
+gdf_spline <- lapply(unique(gdf$compound_no), function(cn) {
+  x <- gdf_spline[gdf_spline$compound_no == cn, "x"]
+  y <- gdf_spline[gdf_spline$compound_no == cn, "y"]
+  present <- which(!is.na(y))
+  mod <- stats::smooth.spline(
+    x = x[present],
+    y = y[present],
+    cv = TRUE
+  )
+  data.frame(
+    compound = cpdNames[cn],
+    compound_no = cn,
+    predict(mod),
+    stringsAsFactors = FALSE
+  )
+})
+gdf_spline <- do.call("rbind", gdf_spline)
+
+## make summary plot
+library(ggplot2)
+ggplot(gdf, aes(x = sample, y = rt)) +
+  geom_point() +
+  facet_wrap(~compound_no,
+    scales = "free_y", ncol = 3,
+    labeller = as_labeller(setNames(cpdNames, nm = seq(length(cpdNames))))
+  ) +
+  geom_line(
+    data = gdf_spline,
+    aes(x, y, group = compound_no), color = "#FDE725FF", size = 1
+  ) +
+  scale_x_continuous(name = "Sample run order") +
+  theme_bw() +
+  ylab("Retention time") +
+  theme(legend.position = "none") +
+  ## make truly minimal theme
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(size = 0.1)
+  )
+
+## save spline models into a csv file to be used for synthetic data generaiton
+spline_models <- setNames(gdf_spline[, c("compound_no", "x", "y")],
+  nm = c("rc", "x", "y")
+)
+write.csv(spline_models, file = "path to csv file with modelled RT drifts")
+```
+
+Then, the `r colFmt("probability of being missed/removed", "Crimson")` was estimated for each peak in the reference sample based on its intensity and user-selected level of missigness. Example below is for experiment in which 5% of all peaks are removed in every simulated table. `modelMISS` writes a .csv file in which the probability of being removed is listed for every peak in the reference sample (argument `miss_probs` for function `simulateDATA`).
+
+```{r}
+modelMISS(
+  fname = "path to processed reference sample csv",
+  out_dir = "path to output directory",
+  miss = 0.05
+)
+```
+
+`r colFmt("Synthetic datasets were generated", "Crimson")` using `simulateDATA` function, which takes the following arguments:
+
+* fname - path to the .csv peak table for the reference sample
+* out_dir - path to output directory
+* meta_dir - path to write the final tables metadata file (will be required for `massFlowR` pipeline, argument `file` for function `buildTMP`)
+* mz_err - desired level of random mz variation
+* rt_err - desired level of random retention time variation (sec)
+* files_batch_n - number of synthetic peak tables to be generated
+* drift_prop - proportion of peak groups that should have systematic RT drift on top the random variation
+* drift - path to .csv file with nonlinear RT drift models obtained by cubic spline
+* miss_probs - path to .csv file with probabilities of missingness for each peak in the reference sample
+* miss - desired proportion of missing peaks in the simulated datasets
+
+```{r}
+simulateDATA(
+  fname = fname,
+  out_dir = "path",
+  meta_dir = "path",
+  mz_err = 0.001,
+  rt_err = 2,
+  files_batch_n = 100,
+  drift_prop = 100,
+  drift = "path to csv file with modelled RT drifts",
+  miss_probs = "path to csv file with missigness probabilities",
+  miss = 0.5
+)
+```
+
+### Precision and recall estimation
+
+The precision and recall estimation was based on methodology described in Lange et al. 2008. Associated functions are defined in *precision-recall-estimation.R script*. Load the required functions:
+
+```{r}
+source(file = "./Chapter_3/precision-recall-estimation.R")
+```
+
+Set the path to the metadata table with simulated filenames, which was generated by function `simulateDATA` in the previous step.
+
+```{r}
+mfile <- "path to .csv metadata file with simulated filenames"
+```
+
+Synthetic datasets were processed with either `massFlowR` or `XCMS`. The obtained package-specific objects were subjected to precision/recall estimation as follows:
+
+```{r}
+## processing with massFlowR
+library(massFlowR)
+
+## create massFlowTemplate class object
+object <- massFlowR::buildTMP(
+  file = mfile, # path to .csv with metadata
+  out_dir = out_dir, # path to output directory
+  rt_err = 4 # allowed RT deviation from sample to sample (sec)
+)
+## align and validate peaks
+object <- massFlowR::alignPEAKS(object,
+  out_dir = out_dir
+)
+object <- massFlowR::validPEAKS(object,
+  out_dir = out_dir, # path to output directory
+  cor_thr = 0.5 # Pearson correlation coefficient threshold for inter-sample correlation
+)
+
+## load simulated data
+meta <- read.csv(mfile, # path to .csv with metadata
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+maps <- lapply(meta$proc_filepath, function(fname) {
+  pks <- read.csv(fname, header = T, stringsAsFactors = F)
+  ## if peaks were removed during data simulation, use column 'peakid_original' instead of the default 'peakid'
+  if ("peakid_original" %in% colnames(pks)) {
+    pks$peakid <- pks$peakid_original
+    pks$peakid_original <- NULL
+  }
+  pks$sample <- which(meta$proc_filepath == fname)
+  return(pks)
+})
+
+## load the original peak table obtained for the reference sample
+sample_map <- read.csv(
+  file = original_fname, # path to .csv file with peak-groups of the reference sample
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+## prepare the ground truth
+ground <- prep_ground(sample_map = sample_map, maps = maps)
+
+## prepare final consensus map
+consensus <- prep_massFlowR(object,
+  valid = TRUE, # if massFlowR::validPEAKS ws applied
+  peakid_original = TRUE # TRUE if simulated tables do not have peaks removed (i.e. experiment A and B)
+)
+
+## evaluate precision/recall
+res <- eval(consensus, ground)
+res$precision # calculated precision value
+res$recall # calculated recall value
+```
+
+
+```{r}
+## processing with XCMS
+library(xcms)
+
+## load simulated data
+meta <- read.csv(mfile, # path to .csv with metadata
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+maps <- lapply(meta$proc_filepath, function(fname) {
+  pks <- read.csv(fname, header = T, stringsAsFactors = F)
+  if ("peakid_original" %in% colnames(pks)) {
+    pks$peakid <- pks$peakid_original
+    pks$peakid_original <- NULL
+  }
+  pks$sample <- which(meta$proc_filepath == fname)
+  return(pks)
+})
+maps_mat <- lapply(meta$proc_filepath, function(fname) {
+  pks <- read.csv(fname, header = T, stringsAsFactors = F)
+  if ("peakid_original" %in% colnames(pks)) {
+    pks$peakid <- pks$peakid_original
+    pks$peakid_original <- NULL
+  }
+  pks$sample <- which(meta$proc_filepath == fname)
+  return(as.matrix(pks))
+})
+maps_mat <- do.call("rbind", maps_mat)
+
+## populate xcmsSet with simulated data
+n <- nrow(meta)
+anno <- data.frame(
+  Filenames = paste0("test", 1:n, ".mzML"),
+  class = rep(1, n),
+  stringsAsFactors = FALSE
+)
+obj <- new("xcmsSet")
+obj@phenoData <- anno
+obj@filepaths <- paste0(out_dir, anno$Filenames)
+obj@peaks <- maps_mat
+
+## XCMS features alignment
+obj <- group(obj,
+  method = "density",
+  minfrac = 0,
+  minsamp = 0,
+  bw = 2,
+  mzwid = 0.01
+)
+
+## load the original peak table obtained for the reference sample
+sample_map <- read.csv(original_fname, # path to .csv file with peak-groups of the reference sample
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+## prepare the ground truth
+ground <- prep_ground(sample_map = sample_map, maps = maps)
+
+## prepare final consensus map
+consensus <- prep_xcms(object = obj)
+
+## evaluate precision/recall
+res <- eval(consensus, ground)
+res$precision # calculated precision value
+res$recall # calculated recall value
+```
+
+### DEVSET processing
+
+DEVSET mzML files were processed with `massFlowR` and `XCMS`. The standard `massFlowR` pipeline, applied to DEVSET samples, is provided below.
+
+```{r}
+## massflowR processing
+# Grouping ----------------------------------------------------------------
+massFlowR::groupPEAKS(
+  file = "path to study metadata", # must incluce columns 'filename', 'run_order' and 'raw_filepath'
+  cwt = cwt, # centWave parameters
+  out_dir = "output directory"
+)
+
+# Alignment ---------------------------------------------------------------
+object <- massFlowR::buildTMP(
+  file = "path to study metadata", # must contain column 'proc_filepath', file is written by groupPEAKS
+  out_dir = "path to output directory",
+  rt_err = 10
+)
+object <- massFlowR::alignPEAKS(object,
+  out_dir = "path to output directory",
+  cutoff = 0.3
+)
+
+# Post-alignment ----------------------------------------------------------
+object <- massFlowR::validPEAKS(object,
+  out_dir = "path to output directory",
+  cor_thr = 0.7,
+  min_samples_prop = 0.1
+)
+object <- massFlowR::fillPEAKS(object,
+  out_dir = "path to output directory"
+)
+```
+
+### XCMS version 3 syntax
+
+DEVSET study, as well as the synthetic datasets, were processed with the standard `XCMS` pipeline, using the **version 3 syntax**.
+
+```{r}
+# Peak-picking ------------------------------------------------------------
+rdat <- MSnbase::readMSData(
+  files = "paths to mzML files",
+  mode = "onDisk"
+)
+## save centWave parameters
+cwt <- xcms::CentWaveParam(
+  ppm = 25,
+  snthresh = 5,
+  noise = 200,
+  prefilter = c(10, 5000),
+  peakwidth = c(1, 5),
+  mzdiff = 0,
+  verboseColumns = TRUE
+)
+xset <- xcms::findChromPeaks(rdat,
+  param = cwt
+) # centWave parameters
+
+# Grouping ----------------------------------------------------------------
+pdp <- xcms::PeakDensityParam(
+  sampleGroups = xset@phenoData@data$sample_type,
+  minFraction = 0,
+  minSamples = 0,
+  bw = 2,
+  binSize = 0.01
+)
+gset <- xcms::groupChromPeaks(xset,
+  param = pdp
+)
+
+# RT correction -------------------------------------------------------------
+pgp <- xcms::PeakGroupsParam(minFraction = 0.85)
+rset <- xcms::adjustRtime(gset,
+  param = pgp
+)
+
+# Grouping -----------------------------------------------------------------
+pdp <- xcms::PeakDensityParam(
+  sampleGroups = rset@phenoData@data$sample_type,
+  minFraction = 0,
+  minSamples = 0,
+  bw = 2,
+  binSize = 0.01
+)
+grset <- xcms::groupChromPeaks(rset, param = pdp)
+
+# Filling peaks ------------------------------------------------------------
+fset <- xcms::fillChromPeaks(grset)
+```
+
+Generated features tables were subjected to `nPYc` toolbox quality control analyses. The general `nPYc` workflow is described in Chapter 2, section [QC pipeline](#qc-pipeline). 
+
+# Chapter 4
+
+## XCMS features annotation
+
+### Standard CAMERA workflow
+
+`r colFmt("XCMS features", "Crimson")` obtained for the AIRWAVE dataset were `r colFmt("automatically annotated", "Crimson")` using standard `CAMERA` workflow.
+
+```{r}
+library(CAMERA)
+
+## Create an xsAnnotate object using the filled xcms object
+an <- CAMERA::xsAnnotate(
+  fset, # xcmsSet class object obtained with the xcms::fillPeaks function
+  nSlaves = 4 # number of parallel workers
+)
+
+# Make sure that filepaths in the xsAnnotate are correct and lead to the raw mzML files, re-asign if needed
+# filepaths(an@xcmsSet) <- "correct filepaths"
+
+# Group features peaks into pseudospectra-groups based on RT
+anF <- CAMERA::groupFWHM(
+  an,
+  perfwhm = 0.6,
+  intval = "into"
+)
+
+# Annotate isotopes
+anI <- CAMERA::findIsotopes(anF, mzabs = 0.01)
+
+# Verify grouping using EIC correlation
+anIC <- CAMERA::groupCorr(anI, cor_eic_th = 0.75)
+
+# Annotate adducts
+anFA <- CAMERA::findAdducts(anIC, polarity = "positive")
+
+# Clean paralell backend
+CAMERA::cleanParallel(an)
+
+# Extract the annotated peaks
+res <- CAMERA::getPeaklist(anFA, intval = "into")
+
+# Save features metadata in a table
+feats <- cbind(
+  res[, 1:7], # standard XCMS features metadata: mz, rt,...
+  res[, seq(ncol(res), to = ncol(res) - 2)] # CAMERA output for every feature: pcgroup, adduct, isotopes
+)
+```
+
+
+### Feature-to-spectra matching algorithm
+
+`r colFmt("XCMS features", "Crimson")` obtained for the AIRWAVE dataset were `r colFmt("annotated to an in-house database", "Crimson")` using a feature-to-spectra matching algorithm. All required functions are provided in *feature-to-spectra-build_DB.R* and *feature-to-spectra-annotate_DS.R* scripts. Load the required functions:
+
+```{r}
+source("./Chapter_4/feature-to-spectra-build_DB.R")
+source("./Chapter_4/feature-to-spectra-annotate_DS.R")
+```
+
+
+Firstly, a database table is built using function `build_DB` that extracts relevant information from the RDA files generated for each chemical standard in the directory. The generated database table is then used to annotate XCMS features via `annotate_DS` function. 
+
+Database RDA files were generated by Dr Matthew Lewis at the IPC prior to the start of this work. For details please refer to **Thesis Chapter 4, Section 4.2.4 "Database generation"**. Scripts provided in this document were developed by E.Lauzikaite. 
+
+
+```{r}
+# build database --------------------------------------------------------------------------------------------------
+db <- build_DB(
+  wd = "path to directory with RDA files",
+  spec.threshold = 0, # BPI threshold for spectrum features, spectrum-wise
+  chem.threshold = 0 # BPI threshold for spectrum features, compound-wise
+)
+
+# annotate --------------------------------------------------------------------------------------------------------
+annotate_DS(
+  matrix_file = "path to XCMS features table", # must contain columns 'm.z' and 'Retention.Time' (original XCMS rt divided from 60)
+  db = db, # database table
+  mz_err = 0.01,
+  rt_err = 0.25, # equals to 15sec
+  thrs = 0, # cutoff threshold
+  save_plot = FALSE, # do not save png plots
+  out_dir = "path to output directory"
+)
+```
+
+## massFlowR spectra annotation
+
+AIRWAVE datasets generated by the `massFlowR` pipeline were `r colFmt("annotated to an in-house database", "Crimson")` using spectra-to-spectra matching approach, encoded within the `massFlowR` package. For details on the functionality, please refer to the [massFlowR repository](https://github.com/lauzikaite/massFlowR).
+
+
+```{r}
+library(massFlowR)
+# build database ----------------------------------------------------------
+massFlowR::buildDB(
+  rda_dir = "path to directory with RDA files",
+  out_dir = "path to output directory"
+)
+
+# create annotation object ------------------------------------------------
+object <- massFlowR::buildANNO(
+  ds_file = "path to features intensity table", # file is generated by massFlowR::fillPEAKS function
+  meta_file = "path to study metadata", # as for massFlowR::alignPEAKS function
+  out_dir = "path to output directory"
+)
+
+# annotate ----------------------------------------------------------------
+object <- annotateDS(
+  object = object,
+  db_file = "path to database table csv", # file is generated by massFlowR::buildDB function
+  out_dir = "path to output directory",
+  mz_err = 0.01, # mz error
+  rt_err = 15, # RT error (sec)
+  ncores = 4 # number of parallel workers
+)
+```
+
+## Annotation validation
+
+Annotations obtained for the AIRWAVE features using either `CAMERA` pipeline, or feature-to-spectra or spectra-to-spectra matching algorithms and an in-house database, were validated using endogenous metabolites.
+
+Firstly, `r colFmt("endogenous metabolites were detected and integrated", "Crimson")` using R package `peakPantheR`, as described in this document's section ["Standard peakPantheR workflow"](#standard-peakpanther-workflow). 
+
+Next, `r colFmt("features corresponding to endogenous metabolites", "Crimson")` were found in the annotated datasets using `massFlowR` function 
+`findADDUCTS`. 
+
+```{r}
+## load endogenous metabolites ROI
+standards <- read.csv(
+  file = "path to metabolites ROI csv", # must contain columns 'mz', 'mzMin', 'mzMax, 'rtMin', 'rtMax'
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+## load annotated features
+feats <- read.csv(
+  file = "path to annotated features csv",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+##  find all features matching to endogenous metabolites
+matches <- massFlowR:::findADDUCTS(
+  feats = feats[, c("mz", "rt")],
+  adducts = standards[, c("mzMin", "mzMax", "rtMin", "rtMax")]
+)
+feats$cpd_index <- unlist(matches)
+colnames(standards)[grep("mz|rt", colnames(standards))] <- paste0("standard_", colnames(standards)[grep("mz|rt", colnames(standards))])
+anno <- merge(feats, standards, by = c("cpd_index"), all = TRUE)
+```
